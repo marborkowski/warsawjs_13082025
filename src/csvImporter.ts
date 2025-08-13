@@ -99,7 +99,30 @@ class ProgressTracker {
 }
 
 /**
- * Utility to yield control back to the event loop for better responsiveness.
+ * Cooperative yielding helper used to keep the UI thread responsive between heavy batches.
+ *
+ * What it does:
+ * - Returns an async function that resolves on the next "idle slice":
+ *   - If `requestIdleCallback` is available, schedules resolution during the browser's
+ *     idle period, with a 16ms timeout to roughly align with one frame at 60fps and to
+ *     guarantee progress even when the main thread is busy.
+ *   - Otherwise, falls back to `setTimeout(0)`, yielding to the next macrotask tick.
+ *
+ * Why it's needed:
+ * - Large CSV parsing and IndexedDB writes can monopolize the main thread.
+ * - Awaiting `microYield()` gives the event loop a chance to:
+ *   - paint frames and keep interactions (scrolling, input) responsive,
+ *   - run GC and other high-priority tasks,
+ *   - process pending timers and user events.
+ *
+ * Important notes:
+ * - This yields a macrotask/idle turn, not a microtask; it's different from `await Promise.resolve()`.
+ * - It does not throttle by itself; it simply introduces cooperative break points between batches.
+ * - Safe to call frequently; after creation, calls are allocation-free besides the scheduled task.
+ *
+ * Usage in this file:
+ * - Called after flushing a batch to IndexedDB and before resuming the Papa parser
+ *   to implement backpressure and avoid long uninterrupted synchronous work.
  */
 function createMicroYield(): () => Promise<void> {
   const globalObj = globalThis as GlobalWithIdleCallback;
@@ -215,69 +238,49 @@ async function attemptParse(
 
     parserState = new ParserState(signal, handleTimeout);
 
-    const flushBuffer = async (parser: Papa.Parser): Promise<void> => {
-      if (buffer.length === 0) return;
-
-      try {
-        await db.rows.bulkAdd(buffer);
-        totalRows += buffer.length;
-        progressTracker.report(totalRows);
-        buffer = [];
-
-        if (parserState && parserState.isOperationAborted()) {
-          throw new ImportAbortedError();
-        }
-
-        await microYield();
-        parser.resume();
-      } catch (error) {
-        parser.abort();
-        throw error instanceof ImportAbortedError
-          ? error
-          : new ImportError(
-              "Failed to write batch to database",
-              error as Error
-            );
-      }
-    };
-
     Papa.parse(file, {
       header: true,
       worker: useWorker,
       skipEmptyLines: true,
       chunkSize: options.chunkSizeBytes,
 
-      step: (results, parser) => {
-        if (parserState) {
-          parserState.setParser(parser);
-        }
+      chunk: async (results, parser) => {
+        parserState?.setParser(parser);
 
-        if (parserState && parserState.isOperationAborted()) {
+        if (parserState?.isOperationAborted()) {
           parser.abort();
           return;
         }
 
-        if (parserState && !parserState.isOperationAborted()) {
-          parserState.markStarted();
-        }
+        parserState?.markStarted();
+        parser.pause();
 
-        // Initialize metadata on first valid row
         if (!isMetaInitialized && results.meta.fields) {
           columns = [...results.meta.fields];
           isMetaInitialized = true;
         }
 
-        // Process current row
-        const rowData = results.data as Record<string, string>;
-        if (rowData && Object.keys(rowData).length > 0) {
-          buffer.push({ data: rowData });
+        for (const row of results.data as Array<Record<string, string>>) {
+          if (row && Object.keys(row).length > 0) {
+            buffer.push({ data: row });
+
+            if (buffer.length >= options.batchSize) {
+              await db.rows.bulkAdd(buffer);
+
+              totalRows += buffer.length;
+              progressTracker.report(totalRows);
+              buffer = [];
+
+              if (parserState?.isOperationAborted()) {
+                throw new ImportAbortedError();
+              }
+
+              await microYield();
+            }
+          }
         }
 
-        // Flush buffer when it reaches batch size
-        if (buffer.length >= options.batchSize) {
-          parser.pause();
-          flushBuffer(parser).catch(reject);
-        }
+        parser.resume();
       },
 
       complete: async (): Promise<void> => {
